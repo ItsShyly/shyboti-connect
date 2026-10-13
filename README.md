@@ -1,4 +1,4 @@
-# ShyBoti for OBS
+# ShyBoti Connect
 
 OBS plugin that connects OBS to ShyBoti.
 
@@ -8,7 +8,6 @@ OBS plugin that connects OBS to ShyBoti.
   websocket server in OBS can stay disabled.
 - Dials out to `wss://shyboti.de/api/agent` with the pairing token
 - Bitrate rules run locally and are cached in the plugin config folder.
-- On first start it takes the token from the old agent (`~/.shyboti-agent/config.json`).
 
 ## Build
 
