@@ -1,4 +1,4 @@
-// >>> port of relay.js, dials out, nothing listens
+// >>> dials out, nothing listens
 #include "agent.hpp"
 
 #include <obs-module.h>
@@ -193,7 +193,8 @@ void relayStart()
 	s->setOnMessageCallback([self, token, url](const ix::WebSocketMessagePtr &m) {
 		using T = ix::WebSocketMessageType;
 		if (m->type == T::Open) {
-			self->sendText(dumpJson({{"op", "identify"}, {"token", token}, {"agentVersion", AGENT_VERSION}}));
+			self->sendText(
+				dumpJson({{"op", "identify"}, {"token", token}, {"agentVersion", AGENT_VERSION}}));
 			return;
 		}
 		if (m->type == T::Message) {
@@ -208,7 +209,7 @@ void relayStart()
 			bool was = identified.exchange(false);
 			uint16_t code = m->closeInfo.code;
 			if (code == 4002) {
-				// >>> old node agent still running, stops the kick loop
+				// >>> two agents kick each other forever otherwise
 				state = RelayState::Replaced;
 				log("Another ShyBoti agent took over this channel. Close the old agent, then press Connect.");
 				self->disableAutomaticReconnection();

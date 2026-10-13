@@ -1,4 +1,4 @@
-// >>> port of rules.js, runs local, cached to disk
+// >>> bitrate rules, run local, cached to disk
 #include "agent.hpp"
 
 #include <algorithm>
@@ -71,14 +71,18 @@ static void execute(const json &rule)
 		std::string sceneName = jstr(scenes, "currentProgramSceneName");
 		json items = obsRequest("GetSceneItemList", {{"sceneName", sceneName}});
 		auto lc = [](std::string s) {
-			std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+			std::transform(s.begin(), s.end(), s.begin(),
+				       [](unsigned char c) { return (char)std::tolower(c); });
 			return s;
 		};
-		json list = items.contains("sceneItems") && items["sceneItems"].is_array() ? items["sceneItems"] : json::array();
+		json list = items.contains("sceneItems") && items["sceneItems"].is_array() ? items["sceneItems"]
+											   : json::array();
 		for (auto &it : list) {
 			if (lc(jstr(it, "sourceName")) != lc(target))
 				continue;
-			bool enabled = action == "show" ? true : action == "hide" ? false : !jtruthy(it, "sceneItemEnabled");
+			bool enabled = action == "show"   ? true
+				       : action == "hide" ? false
+							  : !jtruthy(it, "sceneItemEnabled");
 			obsRequest("SetSceneItemEnabled", {{"sceneName", sceneName},
 							   {"sceneItemId", it["sceneItemId"]},
 							   {"sceneItemEnabled", enabled}});
@@ -130,7 +134,8 @@ void rulesOnBitrate(int kbps)
 				st.badStreak = 0;
 				st.armed = true; // <<< condition cleared, can fire again
 			}
-			if (bad && st.armed && st.badStreak >= DEBOUNCE_SAMPLES && now - st.lastFiredAt >= MIN_REFIRE_MS) {
+			if (bad && st.armed && st.badStreak >= DEBOUNCE_SAMPLES &&
+			    now - st.lastFiredAt >= MIN_REFIRE_MS) {
 				st.armed = false;
 				st.lastFiredAt = now;
 				toFire.push_back(rule);

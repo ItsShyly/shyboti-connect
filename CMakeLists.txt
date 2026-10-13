@@ -41,7 +41,6 @@ if(WIN32)
   # >>> ixwebsocket would look for an installed mbedtls otherwise
   set(USE_MBED_TLS ON CACHE BOOL "" FORCE)
   set(MBEDTLS_FOUND TRUE)
-  set(MBEDTLS_VERSION_GREATER_THAN_3 ON)
   set(MBEDTLS_INCLUDE_DIRS "${mbedtls_SOURCE_DIR}/include")
   set(MBEDTLS_LIBRARIES mbedtls mbedx509 mbedcrypto)
 endif()
@@ -58,6 +57,10 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(ixwebsocket)
+if(WIN32)
+  # >>> its mbedtls 3 check sits inside the find block we skip
+  target_compile_definitions(ixwebsocket PRIVATE IXWEBSOCKET_USE_MBED_TLS_MIN_VERSION_3)
+endif()
 
 # vvv plugin vvv
 add_library(${CMAKE_PROJECT_NAME} MODULE)
@@ -78,17 +81,14 @@ target_compile_options(
   ${CMAKE_PROJECT_NAME}
   PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
 )
-set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
+set_target_properties(
+  ${CMAKE_PROJECT_NAME}
+  PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
+)
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE
-    src/plugin-main.cpp
-    src/settings.cpp
-    src/obs-bridge.cpp
-    src/relay.cpp
-    src/rules.cpp
-    src/ui.cpp
+  PRIVATE src/plugin-main.cpp src/settings.cpp src/obs-bridge.cpp src/relay.cpp src/rules.cpp src/ui.cpp
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
