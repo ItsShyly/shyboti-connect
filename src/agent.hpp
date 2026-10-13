@@ -13,6 +13,8 @@ namespace shy {
 struct Config {
 	std::string token;
 	std::string relayUrl = "wss://shyboti.de/api/agent";
+	bool autoConnect = true;
+	bool dockShown = false;
 };
 Config loadConfig();
 void saveConfig(const Config &c);
@@ -54,6 +56,8 @@ size_t rulesCount();
 
 // vvv ui (ui.cpp) vvv
 void uiInit();
+void uiLoaded();
+void uiShutdown();
 void runOnUi(std::function<void()> fn);
 json probeProjector();
 
