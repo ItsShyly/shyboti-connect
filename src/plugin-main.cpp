@@ -33,8 +33,12 @@ MODULE_EXPORT const char *obs_module_description(void)
 // >>> stop early, obs-websocket dies on exit
 static void onFrontendEvent(enum obs_frontend_event event, void *)
 {
-	if (event == OBS_FRONTEND_EVENT_EXIT)
+	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+		shy::uiLoaded();
+	} else if (event == OBS_FRONTEND_EVENT_EXIT) {
+		shy::uiShutdown();
 		shy::agentStop();
+	}
 }
 
 bool obs_module_load(void)

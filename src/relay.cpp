@@ -330,7 +330,10 @@ void agentStart()
 	if (!obsApiReady())
 		log("obs-websocket is missing in this OBS. Scenes and sources won't work.");
 	obsEventsStart();
-	relayStart();
+	if (loadConfig().autoConnect)
+		relayStart();
+	else
+		log("Auto connect is off. Press Connect.");
 }
 
 void agentStop()

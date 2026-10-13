@@ -69,6 +69,9 @@ Config loadConfig()
 	c.token = jstr(j, "token");
 	if (!jstr(j, "relayUrl").empty())
 		c.relayUrl = jstr(j, "relayUrl");
+	if (j.is_object() && j.contains("autoConnect"))
+		c.autoConnect = jtruthy(j, "autoConnect");
+	c.dockShown = jtruthy(j, "dockShown");
 	// >>> no token yet, check the agent's config
 	if (c.token.empty()) {
 		fs::path old = homeDir() / ".shyboti-agent" / "config.json";
@@ -91,6 +94,8 @@ void saveConfig(const Config &c)
 	if (!j.is_object())
 		j = json::object();
 	j["token"] = c.token;
+	j["autoConnect"] = c.autoConnect;
+	j["dockShown"] = c.dockShown;
 	writeJsonFile(configPath("config.json"), j);
 }
 
