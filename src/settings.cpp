@@ -69,7 +69,7 @@ Config loadConfig()
 	c.token = jstr(j, "token");
 	if (!jstr(j, "relayUrl").empty())
 		c.relayUrl = jstr(j, "relayUrl");
-	// >>> first start: take the token from the old node agent
+	// >>> no token yet, check the agent's config
 	if (c.token.empty()) {
 		fs::path old = homeDir() / ".shyboti-agent" / "config.json";
 		std::ifstream f(old, std::ios::binary);

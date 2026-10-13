@@ -1,4 +1,4 @@
-// >>> tools menu window, replaces the local settings page
+// >>> tools menu window
 #include "agent.hpp"
 
 #include <obs-frontend-api.h>
@@ -33,7 +33,6 @@ void runOnUi(std::function<void()> fn)
 	QMetaObject::invokeMethod(qApp, [fn]() { fn(); }, Qt::QueuedConnection);
 }
 
-// >>> in-process window list, no powershell like the node agent
 static json scanProjectors()
 {
 	static const QRegularExpression re(QStringLiteral("multiview|projector|projektor"),

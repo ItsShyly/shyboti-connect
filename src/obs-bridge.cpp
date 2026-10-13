@@ -1,4 +1,3 @@
-// >>> port of localObs.js, same requests, same answers
 #include "agent.hpp"
 
 #include <obs-module.h>
@@ -25,8 +24,7 @@ namespace fs = std::filesystem;
 
 namespace shy {
 
-// vvv obs-websocket in-process api, no network, no port vvv
-// >>> same layout as obs-websocket's lib/obs-websocket-api.h (GPL-2.0)
+// vvv obs-websocket in-process api vvv
 typedef void (*ws_event_cb)(uint64_t, const char *, const char *, void *);
 struct ws_event_callback {
 	ws_event_cb callback;
@@ -158,15 +156,21 @@ void obsEventsStop()
 }
 
 // vvv helpers vvv
-static const std::regex SETTINGS_KINDS("^(text_gdiplus|text_ft2_source|browser_source|image_source|ffmpeg_source|color_source)");
+static const std::regex
+	SETTINGS_KINDS("^(text_gdiplus|text_ft2_source|browser_source|image_source|ffmpeg_source|color_source)");
 static const std::vector<std::string> TEXT_KINDS = {"text_gdiplus_v3", "text_gdiplus_v2", "text_gdiplus",
 						    "text_ft2_source_v2", "text_ft2_source"};
 static const std::vector<std::string> COLOR_KINDS = {"color_source_v3", "color_source_v2", "color_source"};
-static const std::set<std::string> AUDIO_KINDS = {
-	"wasapi_input_capture",  "wasapi_output_capture", "wasapi_process_output_capture",
-	"coreaudio_input_capture", "coreaudio_output_capture", "pulse_input_capture",
-	"pulse_output_capture",  "ffmpeg_source",         "browser_source",
-	"vlc_source"};
+static const std::set<std::string> AUDIO_KINDS = {"wasapi_input_capture",
+						  "wasapi_output_capture",
+						  "wasapi_process_output_capture",
+						  "coreaudio_input_capture",
+						  "coreaudio_output_capture",
+						  "pulse_input_capture",
+						  "pulse_output_capture",
+						  "ffmpeg_source",
+						  "browser_source",
+						  "vlc_source"};
 static const std::regex IMAGE_EXT("\\.(png|jpe?g|gif|webp|bmp|svg)$", std::regex::icase);
 static const size_t MAX_FILE_BYTES = 15 * 1024 * 1024;
 
@@ -270,9 +274,9 @@ static std::string downloadToMedia(const std::string &url)
 		auto it = res->headers.find("Content-Type");
 		if (it != res->headers.end())
 			type = lower(it->second.substr(0, it->second.find(';')));
-		ext = type == "image/jpeg"	? ".jpg"
-		      : type == "image/gif"	? ".gif"
-		      : type == "image/webp"	? ".webp"
+		ext = type == "image/jpeg"      ? ".jpg"
+		      : type == "image/gif"     ? ".gif"
+		      : type == "image/webp"    ? ".webp"
 		      : type == "image/svg+xml" ? ".svg"
 						: ".png";
 	}
@@ -321,7 +325,8 @@ static json treeItems(const std::string &sceneName, bool isGroup)
 			{"sceneItemIndex", field(it, "sceneItemIndex")},
 			{"enabled", field(it, "sceneItemEnabled")},
 			{"locked", jtruthy(it, "sceneItemLocked")},
-			{"transform", field(it, "sceneItemTransform").is_object() ? field(it, "sceneItemTransform") : json::object()},
+			{"transform", field(it, "sceneItemTransform").is_object() ? field(it, "sceneItemTransform")
+										  : json::object()},
 		};
 		if (!kind.empty() && std::regex_search(kind, SETTINGS_KINDS)) {
 			try {
@@ -411,7 +416,9 @@ static json createFromElement(const json &data)
 				 {"close_when_inactive", false}};
 	} else if (kindIn == "browser") {
 		inputKind = "browser_source";
-		inputSettings = {{"url", jstr(s, "url")}, {"width", (int)std::lround(bw)}, {"height", (int)std::lround(bh)}};
+		inputSettings = {{"url", jstr(s, "url")},
+				 {"width", (int)std::lround(bw)},
+				 {"height", (int)std::lround(bh)}};
 	} else if (kindIn == "color") {
 		inputKind = pickKind(COLOR_KINDS);
 		inputSettings = {{"color", field(s, "colorAbgr")},
@@ -487,8 +494,8 @@ static json sceneItemList(const json &data)
 			json t = obsRequest("GetSceneItemTransform",
 					    {{"sceneName", sceneName}, {"sceneItemId", field(it, "sceneItemId")}});
 			json tf = field(t, "sceneItemTransform");
-			for (const char *k : {"positionX", "positionY", "scaleX", "scaleY", "rotation", "width", "height",
-					      "sourceWidth", "sourceHeight", "alignment"})
+			for (const char *k : {"positionX", "positionY", "scaleX", "scaleY", "rotation", "width",
+					      "height", "sourceWidth", "sourceHeight", "alignment"})
 				base[k] = field(tf, k);
 		} catch (...) {
 			// >>> groups skip transform fields
@@ -669,7 +676,8 @@ json handleRelayRequest(const std::string &type, const json &dataIn)
 					   {"imageFormat", jstr(data, "format") == "png" ? "png" : "jpg"},
 					   {"imageWidth", width},
 					   {"imageCompressionQuality", quality}});
-		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+				  .count();
 		return {{"imageData", field(d, "imageData")}, {"cpuMs", ms}};
 	}
 	if (type == "GetVideoMixProjectorState")
@@ -678,12 +686,14 @@ json handleRelayRequest(const std::string &type, const json &dataIn)
 		json state = probeProjector();
 		if (jtruthy(state, "open"))
 			return state;
-		obsRequest(type, {{"videoMixType", jstr(data, "videoMixType", "OBS_WEBSOCKET_VIDEO_MIX_TYPE_MULTIVIEW")},
-				  {"monitorIndex", -1}});
+		obsRequest(type,
+			   {{"videoMixType", jstr(data, "videoMixType", "OBS_WEBSOCKET_VIDEO_MIX_TYPE_MULTIVIEW")},
+			    {"monitorIndex", -1}});
 		return probeProjector();
 	}
 	if (type == "OpenSourceProjector") {
-		obsRequest(type, {{"sourceName", jstr(data, "sourceName")}, {"monitorIndex", -1}, {"projectorGeometry", ""}});
+		obsRequest(type,
+			   {{"sourceName", jstr(data, "sourceName")}, {"monitorIndex", -1}, {"projectorGeometry", ""}});
 		return json::object();
 	}
 	if (type == "GetStats")
@@ -693,8 +703,9 @@ json handleRelayRequest(const std::string &type, const json &dataIn)
 		return json::object();
 	}
 	if (type == "SetInputUrl") {
-		obsRequest("SetInputSettings",
-			   {{"inputName", inputName}, {"inputSettings", {{"url", jstr(data, "url")}}}, {"overlay", true}});
+		obsRequest("SetInputSettings", {{"inputName", inputName},
+						{"inputSettings", {{"url", jstr(data, "url")}}},
+						{"overlay", true}});
 		return json::object();
 	}
 	if (type == "SetupAudioSource") {
@@ -706,9 +717,10 @@ json handleRelayRequest(const std::string &type, const json &dataIn)
 			   {{"inputName", inputName}, {"inputSettings", {{"reroute_audio", true}}}, {"overlay", true}});
 		json mon = field(data, "monitor");
 		bool off = mon.is_boolean() && !mon.get<bool>();
-		obsRequest("SetInputAudioMonitorType",
-			   {{"inputName", inputName},
-			    {"monitorType", off ? "OBS_MONITORING_TYPE_NONE" : "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT"}});
+		obsRequest(
+			"SetInputAudioMonitorType",
+			{{"inputName", inputName},
+			 {"monitorType", off ? "OBS_MONITORING_TYPE_NONE" : "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT"}});
 		json tracks = arr(data, "tracks");
 		if (!tracks.empty()) {
 			json t = json::object();
@@ -730,7 +742,8 @@ json handleRelayRequest(const std::string &type, const json &dataIn)
 		return {{"monitor", jstr(m, "monitorType") != "OBS_MONITORING_TYPE_NONE"}, {"tracks", tracks}};
 	}
 	if (type == "RefreshBrowserSource") {
-		obsRequest("PressInputPropertiesButton", {{"inputName", inputName}, {"propertyName", "refreshnocache"}});
+		obsRequest("PressInputPropertiesButton",
+			   {{"inputName", inputName}, {"propertyName", "refreshnocache"}});
 		return json::object();
 	}
 	throw std::runtime_error("unknown request type \"" + type + "\"");
