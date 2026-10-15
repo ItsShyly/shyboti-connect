@@ -1,8 +1,12 @@
-// >>> live preview: small h264 feeds, only while someone watches
-// "" = program output (free, obs renders it anyway), else one picked scene
+// >>> live preview video, only runs while someone watches
 #include "agent.hpp"
 
 #include <obs-module.h>
+#include <graphics/graphics.h>
+#include <graphics/vec4.h>
+#include <media-io/video-frame.h>
+#include <media-io/video-io.h>
+#include <util/platform.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,17 +29,17 @@ struct Preset {
 	int kbps;
 	const char *name;
 };
-// >>> index = PreviewQuality in the config
+// >>> same order as the dock dropdown
 static const Preset PRESETS[] = {
 	{0, 0, 0, "off"},
 	{640, 15, 300, "low"},
 	{960, 30, 600, "medium"},
 	{1280, 30, 1200, "high"},
 };
-static const size_t PV_MAX_SCENES = 2; // <<< each one is an extra render + encoder session
-// >>> dashboard repeats the wanted list every 10s, silence means nobody's left
+static const size_t PV_MAX_SCENES = 2; // <<< each extra scene costs gpu + an encoder
+// >>> server pings every 10s, no ping = nobody watching
 static const auto PV_KEEPALIVE = std::chrono::seconds(25);
-// >>> stream has to stay calm this long before quality comes back
+// >>> wait a bit before going back up
 static const auto PV_CALM = std::chrono::seconds(30);
 
 static std::atomic<int> pvQuality{2};
@@ -44,21 +48,29 @@ static std::atomic<bool> pvLowered{false};
 
 struct Feed {
 	std::string scene;
-	obs_source_t *scene_src = nullptr;
-	obs_view_t *view = nullptr;
 	obs_encoder_t *enc = nullptr;
 	obs_output_t *out = nullptr;
 	std::atomic<bool> waitKey{true};
+	// vvv picked scenes only, we draw those ourselves vvv
+	obs_source_t *scene_src = nullptr;
+	video_t *video = nullptr;
+	gs_texrender_t *tr = nullptr;
+	gs_stagesurf_t *stage = nullptr;
+	bool staged = false;
+	bool ticking = false;
+	uint32_t w = 0, h = 0, baseW = 0, baseH = 0;
+	uint32_t every = 1, tickN = 0;
 };
 
 static std::mutex pvMu;
 static std::map<std::string, std::unique_ptr<Feed>> feeds;
-static std::string pvEncId; // <<< first encoder that worked, skip the rest next time
+// >>> remember what worked so we don't retry broken ones
+static std::string pvEncIdTex, pvEncIdRaw;
 static int pvRunningQuality = -1;
 static std::vector<std::string> pvWanted;
 static std::chrono::steady_clock::time_point pvLastOn;
 
-// vvv output that hands packets to the relay vvv
+// vvv fake output, just forwards packets to shyboti vvv
 struct PvData {
 	obs_output_t *output;
 	Feed *feed;
@@ -95,13 +107,13 @@ static void pvStop(void *data, uint64_t)
 	obs_output_end_data_capture(static_cast<PvData *>(data)->output);
 }
 
-// >>> frame: kind 2, flags (1 = key), pts us f64, u16 scene len, scene, annex b
+// >>> header layout must match previewVideo.ts on the server
 static void pvPacket(void *data, struct encoder_packet *pkt)
 {
 	Feed *feed = static_cast<PvData *>(data)->feed;
 	if (!pkt || pkt->type != OBS_ENCODER_VIDEO)
 		return;
-	// >>> a viewer can't start mid gop, and drops resume at the next key
+	// >>> after a drop, wait for a keyframe or the picture breaks
 	if (feed->waitKey && !pkt->keyframe)
 		return;
 
@@ -117,11 +129,11 @@ static void pvPacket(void *data, struct encoder_packet *pkt)
 	buf.resize(head + extraSize + pkt->size);
 	buf[0] = 2;
 	buf[1] = pkt->keyframe ? 1 : 0;
-	std::memcpy(&buf[2], &ptsUs, 8); // <<< little endian on every obs platform
+	std::memcpy(&buf[2], &ptsUs, 8); // <<< all obs platforms are little endian
 	std::memcpy(&buf[10], &nameLen, 2);
 	if (nameLen)
 		std::memcpy(&buf[12], feed->scene.data(), nameLen);
-	// >>> sps/pps in front of every key so the browser can join anytime
+	// >>> codec info on every keyframe, so late viewers can start
 	if (extraSize)
 		std::memcpy(&buf[head], extra, extraSize);
 	std::memcpy(&buf[head + extraSize], pkt->data, pkt->size);
@@ -148,28 +160,43 @@ void previewRegister()
 	obs_register_output(&out);
 }
 
-// vvv encoder pick: hardware first, x264 as the fallback vvv
-static std::vector<std::string> pvEncoderIds()
+// vvv encoder pick, gpu first, x264 if nothing else works vvv
+static bool isHardware(const std::string &id)
 {
-	std::vector<std::string> hw, sw;
+	for (const char *k : {"nvenc", "amf", "qsv", "videotoolbox"})
+		if (id.find(k) != std::string::npos)
+			return true;
+	return false;
+}
+
+// >>> texture encoders crash on our own video, scenes use plain ones
+static std::vector<std::string> pvEncoderIds(bool raw)
+{
+	std::vector<std::string> hw;
+	bool x264 = false;
 	const char *id = nullptr;
 	for (size_t i = 0; obs_enum_encoder_types(i, &id); i++) {
 		const char *codec = obs_get_encoder_codec(id);
 		if (!codec || std::strcmp(codec, "h264") != 0)
 			continue;
 		uint32_t caps = obs_get_encoder_caps(id);
-		if (caps & (OBS_ENCODER_CAP_DEPRECATED | OBS_ENCODER_CAP_INTERNAL))
+		if (caps & OBS_ENCODER_CAP_DEPRECATED)
 			continue;
-		(caps & OBS_ENCODER_CAP_PASS_TEXTURE ? hw : sw).push_back(id);
-	}
-	for (auto &s : sw)
-		if (s == "obs_x264")
+		std::string s = id;
+		if (s == "obs_x264") {
+			x264 = true;
+			continue;
+		}
+		bool tex = caps & OBS_ENCODER_CAP_PASS_TEXTURE;
+		if (raw ? (!tex && isHardware(s)) : (tex && !(caps & OBS_ENCODER_CAP_INTERNAL)))
 			hw.push_back(s);
-	if (!pvEncId.empty()) {
-		auto it = std::find(hw.begin(), hw.end(), pvEncId);
-		if (it != hw.end())
-			std::rotate(hw.begin(), it, it + 1);
 	}
+	if (x264)
+		hw.push_back("obs_x264");
+	const std::string &last = raw ? pvEncIdRaw : pvEncIdTex;
+	auto it = std::find(hw.begin(), hw.end(), last);
+	if (it != hw.end())
+		std::rotate(hw.begin(), it, it + 1);
 	return hw;
 }
 
@@ -178,9 +205,9 @@ static obs_data_t *pvSettings(const std::string &id, const Preset &p)
 	obs_data_t *s = obs_data_create();
 	obs_data_set_string(s, "rate_control", "CBR");
 	obs_data_set_int(s, "bitrate", p.kbps);
-	// >>> short gop, switching scenes waits for the next key
+	// >>> keyframe every second, scene switches don't hang long
 	obs_data_set_int(s, "keyint_sec", 1);
-	// >>> no b frames, keys differ per encoder
+	// >>> no b frames, every encoder names it differently
 	if (id == "obs_x264") {
 		obs_data_set_string(s, "preset", "veryfast");
 		obs_data_set_string(s, "tune", "zerolatency");
@@ -201,10 +228,55 @@ static obs_data_t *pvSettings(const std::string &id, const Preset &p)
 	return s;
 }
 
-// >>> encoder has to be off the mix before the view goes away
+// >>> grab last frame's copy, gpu is done so obs never waits
+static void feedTick(void *param, float)
+{
+	auto *f = static_cast<Feed *>(param);
+	if (++f->tickN % f->every)
+		return;
+	obs_enter_graphics();
+	if (f->staged) {
+		uint8_t *data = nullptr;
+		uint32_t linesize = 0;
+		if (gs_stagesurface_map(f->stage, &data, &linesize)) {
+			struct video_frame frame;
+			if (video_output_lock_frame(f->video, &frame, 1, os_gettime_ns())) {
+				uint32_t row = f->w * 4;
+				for (uint32_t y = 0; y < f->h; y++)
+					std::memcpy(frame.data[0] + (size_t)y * frame.linesize[0],
+						    data + (size_t)y * linesize, std::min(row, frame.linesize[0]));
+				video_output_unlock_frame(f->video);
+			}
+			gs_stagesurface_unmap(f->stage);
+		}
+		f->staged = false;
+	}
+	gs_texrender_reset(f->tr);
+	if (gs_texrender_begin(f->tr, f->w, f->h)) {
+		struct vec4 zero;
+		vec4_zero(&zero);
+		gs_clear(GS_CLEAR_COLOR, &zero, 0.0f, 0);
+		// >>> draws the full scene shrunk, no big render first
+		gs_ortho(0.0f, (float)f->baseW, 0.0f, (float)f->baseH, -100.0f, 100.0f);
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+		obs_source_video_render(f->scene_src);
+		gs_blend_state_pop();
+		gs_texrender_end(f->tr);
+		gs_stage_texture(f->stage, gs_texrender_get_texture(f->tr));
+		f->staged = true;
+	}
+	obs_leave_graphics();
+}
+
+// >>> order matters here, wrong order crashes obs
 static void feedTeardown(Feed &f)
 {
 	using namespace std::chrono_literals;
+	if (f.ticking) {
+		obs_remove_tick_callback(feedTick, &f);
+		f.ticking = false;
+	}
 	if (f.out) {
 		obs_output_stop(f.out);
 		for (int i = 0; i < 40 && obs_output_active(f.out); i++)
@@ -218,13 +290,20 @@ static void feedTeardown(Feed &f)
 		obs_encoder_release(f.enc);
 		f.enc = nullptr;
 	}
-	if (f.view) {
-		obs_view_remove(f.view);
-		obs_view_set_source(f.view, 0, nullptr);
-		obs_view_destroy(f.view);
-		f.view = nullptr;
+	if (f.video) {
+		video_output_close(f.video);
+		f.video = nullptr;
+	}
+	if (f.tr || f.stage) {
+		obs_enter_graphics();
+		gs_texrender_destroy(f.tr);
+		gs_stagesurface_destroy(f.stage);
+		obs_leave_graphics();
+		f.tr = nullptr;
+		f.stage = nullptr;
 	}
 	if (f.scene_src) {
+		obs_source_dec_showing(f.scene_src);
 		obs_source_release(f.scene_src);
 		f.scene_src = nullptr;
 	}
@@ -251,16 +330,36 @@ static bool feedStart(Feed &f, const std::string &encId, const Preset &p)
 			obs_source_release(scene);
 			return false;
 		}
+		// >>> "showing" not "active", so media doesn't restart
+		obs_source_inc_showing(scene);
 		f.scene_src = scene;
-		f.view = obs_view_create();
-		// >>> aux views only mark it showing, media + browser sources don't restart
-		obs_view_set_source(f.view, 0, scene);
-		// >>> own mix, scaled down on the gpu
-		struct obs_video_info vovi = ovi;
-		vovi.output_width = w;
-		vovi.output_height = h;
-		video = obs_view_add2(f.view, &vovi);
-		if (!video)
+		f.w = w;
+		f.h = h;
+		f.baseW = ovi.base_width;
+		f.baseH = ovi.base_height;
+		f.every = div;
+
+		struct video_output_info voi = {};
+		voi.name = "shyboti-preview";
+		voi.format = VIDEO_FORMAT_RGBA; // <<< obs converts this on another thread
+		voi.fps_num = ovi.fps_num;
+		voi.fps_den = ovi.fps_den * div;
+		voi.width = w;
+		voi.height = h;
+		voi.cache_size = 4;
+		voi.colorspace = VIDEO_CS_709;
+		voi.range = VIDEO_RANGE_PARTIAL;
+		if (video_output_open(&f.video, &voi) != VIDEO_OUTPUT_SUCCESS) {
+			f.video = nullptr;
+			return false;
+		}
+		video = f.video;
+
+		obs_enter_graphics();
+		f.tr = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		f.stage = gs_stagesurface_create(w, h, GS_RGBA);
+		obs_leave_graphics();
+		if (!f.tr || !f.stage)
 			return false;
 	}
 
@@ -271,12 +370,12 @@ static bool feedStart(Feed &f, const std::string &encId, const Preset &p)
 		return false;
 	obs_encoder_set_video(f.enc, video);
 	if (f.scene.empty()) {
-		// >>> gpu scaling, the stream encoder never sees this
+		// >>> scaled on the gpu, stream stays untouched
 		obs_encoder_set_gpu_scale_type(f.enc, OBS_SCALE_BICUBIC);
 		obs_encoder_set_scaled_size(f.enc, w, h);
+		if (div > 1)
+			obs_encoder_set_frame_rate_divisor(f.enc, div);
 	}
-	if (div > 1)
-		obs_encoder_set_frame_rate_divisor(f.enc, div);
 
 	obs_data_t *os = obs_data_create();
 	obs_data_set_int(os, "feed", (long long)(intptr_t)&f);
@@ -285,7 +384,14 @@ static bool feedStart(Feed &f, const std::string &encId, const Preset &p)
 	if (!f.out)
 		return false;
 	obs_output_set_video_encoder(f.out, f.enc);
-	return obs_output_start(f.out);
+	if (!obs_output_start(f.out))
+		return false;
+	// >>> start drawing only once the encoder is ready
+	if (f.video) {
+		obs_add_tick_callback(feedTick, &f);
+		f.ticking = true;
+	}
+	return true;
 }
 
 static bool feedRunning(const Feed &f)
@@ -293,7 +399,7 @@ static bool feedRunning(const Feed &f)
 	return f.out && obs_output_active(f.out);
 }
 
-// >>> struggling stream drops everything to low until it's calm again
+// >>> stream struggling = everything drops to low
 static int effectiveQuality()
 {
 	int q = pvQuality;
@@ -307,17 +413,17 @@ static void teardownAllLocked()
 	feeds.clear();
 }
 
-// >>> wanted list in, running list out. extra scenes past the cap are ignored
+// >>> scenes past the cap just get skipped
 static json applyLocked(const std::vector<std::string> &wanted)
 {
 	int q = effectiveQuality();
 	json status = {{"quality", PRESETS[q].name}, {"lowered", q != pvQuality.load()}};
-	// >>> new preset means new encoders, no way to change size on the fly
+	// >>> can't resize a running encoder, restart all
 	if (q != pvRunningQuality)
 		teardownAllLocked();
 	pvRunningQuality = q;
 	if (q == 0) {
-		pvWanted = wanted; // <<< kept so switching off -> on starts right away
+		pvWanted = wanted; // <<< so turning it back on is instant
 		status["running"] = json::array();
 		return status;
 	}
@@ -352,13 +458,15 @@ static json applyLocked(const std::vector<std::string> &wanted)
 			running.push_back(s);
 			continue;
 		}
-		for (auto &id : pvEncoderIds()) {
+		bool raw = !s.empty();
+		for (auto &id : pvEncoderIds(raw)) {
 			auto f = std::make_unique<Feed>();
 			f->scene = s;
 			if (feedStart(*f, id, p)) {
-				if (pvEncId != id)
+				std::string &last = raw ? pvEncIdRaw : pvEncIdTex;
+				if (last != id)
 					log("Live preview uses " + id + ".");
-				pvEncId = id;
+				last = id;
 				feeds[s] = std::move(f);
 				running.push_back(s);
 				break;
@@ -367,7 +475,7 @@ static json applyLocked(const std::vector<std::string> &wanted)
 		}
 	}
 	status["running"] = running;
-	status["encoder"] = pvEncId;
+	status["encoder"] = pvEncIdTex;
 	return status;
 }
 
@@ -392,7 +500,7 @@ void previewConfigure(int quality, bool autoLower)
 	pvAutoLower = autoLower;
 }
 
-// >>> ticker feeds this every few seconds while streaming
+// >>> called every few seconds from the bitrate check
 void previewNoteCongestion(bool congested)
 {
 	static std::chrono::steady_clock::time_point lastBad;
@@ -417,7 +525,7 @@ void previewTick()
 		pvRunningQuality = -1;
 		return;
 	}
-	// >>> dock change or congestion, restart at the new preset
+	// >>> quality changed in the dock or by congestion
 	if (effectiveQuality() != pvRunningQuality)
 		applyLocked(std::vector<std::string>(pvWanted));
 }
