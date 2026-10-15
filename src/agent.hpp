@@ -47,6 +47,13 @@ void relayStop();
 RelayState relayState();
 std::string relayChannel();
 void relaySendEvent(const std::string &type, const json &data);
+bool relaySendBinary(const std::string &buf);
+
+// vvv live preview (preview.cpp) vvv
+void previewRegister();
+json previewSet(const std::vector<std::string> &wanted);
+void previewOff();
+void previewTick();
 
 // vvv rules (rules.cpp) vvv
 void rulesLoad();

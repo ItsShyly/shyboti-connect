@@ -1,0 +1,347 @@
+// >>> live preview: small h264 feeds, only while someone watches
+// "" = program output (free, obs renders it anyway), else one picked scene
+#include "agent.hpp"
+
+#include <obs-module.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace shy {
+
+static const uint32_t PV_WIDTH = 960;
+static const int PV_KBPS = 900;
+static const int PV_FPS = 30;
+static const size_t PV_MAX_SCENES = 2; // <<< each one is an extra render + encoder session
+// >>> dashboard repeats the wanted list every 10s, silence means nobody's left
+static const auto PV_KEEPALIVE = std::chrono::seconds(25);
+
+struct Feed {
+	std::string scene;
+	obs_source_t *scene_src = nullptr;
+	obs_view_t *view = nullptr;
+	obs_encoder_t *enc = nullptr;
+	obs_output_t *out = nullptr;
+	std::atomic<bool> waitKey{true};
+};
+
+static std::mutex pvMu;
+static std::map<std::string, std::unique_ptr<Feed>> feeds;
+static std::string pvEncId; // <<< first encoder that worked, skip the rest next time
+static std::chrono::steady_clock::time_point pvLastOn;
+
+// vvv output that hands packets to the relay vvv
+struct PvData {
+	obs_output_t *output;
+	Feed *feed;
+};
+
+static const char *pvName(void *)
+{
+	return "ShyBoti Preview";
+}
+
+static void *pvCreate(obs_data_t *settings, obs_output_t *output)
+{
+	return new PvData{output, (Feed *)(intptr_t)obs_data_get_int(settings, "feed")};
+}
+
+static void pvDestroy(void *data)
+{
+	delete static_cast<PvData *>(data);
+}
+
+static bool pvStart(void *data)
+{
+	auto *d = static_cast<PvData *>(data);
+	if (!obs_output_can_begin_data_capture(d->output, 0))
+		return false;
+	if (!obs_output_initialize_encoders(d->output, 0))
+		return false;
+	d->feed->waitKey = true;
+	return obs_output_begin_data_capture(d->output, 0);
+}
+
+static void pvStop(void *data, uint64_t)
+{
+	obs_output_end_data_capture(static_cast<PvData *>(data)->output);
+}
+
+// >>> frame: kind 2, flags (1 = key), pts us f64, u16 scene len, scene, annex b
+static void pvPacket(void *data, struct encoder_packet *pkt)
+{
+	Feed *feed = static_cast<PvData *>(data)->feed;
+	if (!pkt || pkt->type != OBS_ENCODER_VIDEO)
+		return;
+	// >>> a viewer can't start mid gop, and drops resume at the next key
+	if (feed->waitKey && !pkt->keyframe)
+		return;
+
+	uint8_t *extra = nullptr;
+	size_t extraSize = 0;
+	if (pkt->keyframe && pkt->encoder)
+		obs_encoder_get_extra_data(pkt->encoder, &extra, &extraSize);
+
+	double ptsUs = pkt->timebase_den ? (double)pkt->pts * 1e6 * pkt->timebase_num / pkt->timebase_den : 0;
+	uint16_t nameLen = (uint16_t)std::min<size_t>(feed->scene.size(), 0xffff);
+	size_t head = 12 + nameLen;
+	std::string buf;
+	buf.resize(head + extraSize + pkt->size);
+	buf[0] = 2;
+	buf[1] = pkt->keyframe ? 1 : 0;
+	std::memcpy(&buf[2], &ptsUs, 8); // <<< little endian on every obs platform
+	std::memcpy(&buf[10], &nameLen, 2);
+	if (nameLen)
+		std::memcpy(&buf[12], feed->scene.data(), nameLen);
+	// >>> sps/pps in front of every key so the browser can join anytime
+	if (extraSize)
+		std::memcpy(&buf[head], extra, extraSize);
+	std::memcpy(&buf[head + extraSize], pkt->data, pkt->size);
+
+	bool sent = relaySendBinary(buf);
+	if (!sent)
+		feed->waitKey = true;
+	else if (pkt->keyframe)
+		feed->waitKey = false;
+}
+
+void previewRegister()
+{
+	static struct obs_output_info out = {};
+	out.id = "shyboti_preview_output";
+	out.flags = OBS_OUTPUT_VIDEO | OBS_OUTPUT_ENCODED;
+	out.get_name = pvName;
+	out.create = pvCreate;
+	out.destroy = pvDestroy;
+	out.start = pvStart;
+	out.stop = pvStop;
+	out.encoded_packet = pvPacket;
+	out.encoded_video_codecs = "h264";
+	obs_register_output(&out);
+}
+
+// vvv encoder pick: hardware first, x264 as the fallback vvv
+static std::vector<std::string> pvEncoderIds()
+{
+	std::vector<std::string> hw, sw;
+	const char *id = nullptr;
+	for (size_t i = 0; obs_enum_encoder_types(i, &id); i++) {
+		const char *codec = obs_get_encoder_codec(id);
+		if (!codec || std::strcmp(codec, "h264") != 0)
+			continue;
+		uint32_t caps = obs_get_encoder_caps(id);
+		if (caps & (OBS_ENCODER_CAP_DEPRECATED | OBS_ENCODER_CAP_INTERNAL))
+			continue;
+		(caps & OBS_ENCODER_CAP_PASS_TEXTURE ? hw : sw).push_back(id);
+	}
+	for (auto &s : sw)
+		if (s == "obs_x264")
+			hw.push_back(s);
+	if (!pvEncId.empty()) {
+		auto it = std::find(hw.begin(), hw.end(), pvEncId);
+		if (it != hw.end())
+			std::rotate(hw.begin(), it, it + 1);
+	}
+	return hw;
+}
+
+static obs_data_t *pvSettings(const std::string &id)
+{
+	obs_data_t *s = obs_data_create();
+	obs_data_set_string(s, "rate_control", "CBR");
+	obs_data_set_int(s, "bitrate", PV_KBPS);
+	// >>> short gop, switching scenes waits for the next key
+	obs_data_set_int(s, "keyint_sec", 1);
+	// >>> no b frames, keys differ per encoder
+	if (id == "obs_x264") {
+		obs_data_set_string(s, "preset", "veryfast");
+		obs_data_set_string(s, "tune", "zerolatency");
+		obs_data_set_string(s, "profile", "baseline");
+	} else if (id.find("nvenc") != std::string::npos) {
+		obs_data_set_string(s, "preset", "p1");
+		obs_data_set_string(s, "tune", "ll");
+		obs_data_set_int(s, "bf", 0);
+	} else if (id.find("amf") != std::string::npos) {
+		obs_data_set_string(s, "preset", "speed");
+		obs_data_set_int(s, "bf", 0);
+	} else if (id.find("qsv") != std::string::npos) {
+		obs_data_set_string(s, "target_usage", "TU7");
+		obs_data_set_int(s, "bframes", 0);
+	} else if (id.find("videotoolbox") != std::string::npos) {
+		obs_data_set_bool(s, "bframes", false);
+	}
+	return s;
+}
+
+// >>> encoder has to be off the mix before the view goes away
+static void feedTeardown(Feed &f)
+{
+	using namespace std::chrono_literals;
+	if (f.out) {
+		obs_output_stop(f.out);
+		for (int i = 0; i < 40 && obs_output_active(f.out); i++)
+			std::this_thread::sleep_for(50ms);
+		obs_output_release(f.out);
+		f.out = nullptr;
+	}
+	if (f.enc) {
+		for (int i = 0; i < 40 && obs_encoder_active(f.enc); i++)
+			std::this_thread::sleep_for(50ms);
+		obs_encoder_release(f.enc);
+		f.enc = nullptr;
+	}
+	if (f.view) {
+		obs_view_remove(f.view);
+		obs_view_set_source(f.view, 0, nullptr);
+		obs_view_destroy(f.view);
+		f.view = nullptr;
+	}
+	if (f.scene_src) {
+		obs_source_release(f.scene_src);
+		f.scene_src = nullptr;
+	}
+}
+
+static bool feedStart(Feed &f, const std::string &encId)
+{
+	struct obs_video_info ovi;
+	if (!obs_get_video_info(&ovi) || !ovi.base_width || !ovi.base_height)
+		return false;
+	uint32_t w = std::min<uint32_t>(PV_WIDTH, ovi.base_width);
+	// >>> encoders want even sizes
+	uint32_t h = (uint32_t)std::lround((double)ovi.base_height * w / ovi.base_width) & ~1u;
+	w &= ~1u;
+	double fps = ovi.fps_den ? (double)ovi.fps_num / ovi.fps_den : 30;
+	uint32_t div = (uint32_t)std::max(1L, std::lround(fps / PV_FPS));
+
+	video_t *video = obs_get_video();
+	if (!f.scene.empty()) {
+		obs_source_t *scene = obs_get_source_by_name(f.scene.c_str());
+		if (!scene)
+			return false;
+		if (!obs_source_is_scene(scene)) {
+			obs_source_release(scene);
+			return false;
+		}
+		f.scene_src = scene;
+		f.view = obs_view_create();
+		// >>> aux views only mark it showing, media + browser sources don't restart
+		obs_view_set_source(f.view, 0, scene);
+		// >>> own mix, scaled down on the gpu
+		struct obs_video_info vovi = ovi;
+		vovi.output_width = w;
+		vovi.output_height = h;
+		video = obs_view_add2(f.view, &vovi);
+		if (!video)
+			return false;
+	}
+
+	obs_data_t *s = pvSettings(encId);
+	f.enc = obs_video_encoder_create(encId.c_str(), "shyboti-preview-enc", s, nullptr);
+	obs_data_release(s);
+	if (!f.enc)
+		return false;
+	obs_encoder_set_video(f.enc, video);
+	if (f.scene.empty()) {
+		// >>> gpu scaling, the stream encoder never sees this
+		obs_encoder_set_gpu_scale_type(f.enc, OBS_SCALE_BICUBIC);
+		obs_encoder_set_scaled_size(f.enc, w, h);
+	}
+	if (div > 1)
+		obs_encoder_set_frame_rate_divisor(f.enc, div);
+
+	obs_data_t *os = obs_data_create();
+	obs_data_set_int(os, "feed", (long long)(intptr_t)&f);
+	f.out = obs_output_create("shyboti_preview_output", "shyboti-preview", os, nullptr);
+	obs_data_release(os);
+	if (!f.out)
+		return false;
+	obs_output_set_video_encoder(f.out, f.enc);
+	return obs_output_start(f.out);
+}
+
+static bool feedRunning(const Feed &f)
+{
+	return f.out && obs_output_active(f.out);
+}
+
+// >>> wanted list in, running list out. extra scenes past the cap are ignored
+json previewSet(const std::vector<std::string> &wanted)
+{
+	std::lock_guard<std::mutex> l(pvMu);
+	pvLastOn = std::chrono::steady_clock::now();
+
+	std::vector<std::string> want;
+	size_t sceneCount = 0;
+	for (auto &s : wanted) {
+		if (std::find(want.begin(), want.end(), s) != want.end())
+			continue;
+		if (!s.empty() && sceneCount >= PV_MAX_SCENES)
+			continue;
+		if (!s.empty())
+			sceneCount++;
+		want.push_back(s);
+	}
+
+	for (auto it = feeds.begin(); it != feeds.end();) {
+		bool keep = std::find(want.begin(), want.end(), it->first) != want.end() && feedRunning(*it->second);
+		if (keep) {
+			++it;
+			continue;
+		}
+		feedTeardown(*it->second);
+		it = feeds.erase(it);
+	}
+
+	json running = json::array();
+	for (auto &s : want) {
+		if (feeds.count(s)) {
+			running.push_back(s);
+			continue;
+		}
+		for (auto &id : pvEncoderIds()) {
+			auto f = std::make_unique<Feed>();
+			f->scene = s;
+			if (feedStart(*f, id)) {
+				if (pvEncId != id)
+					log("Live preview uses " + id + ".");
+				pvEncId = id;
+				feeds[s] = std::move(f);
+				running.push_back(s);
+				break;
+			}
+			feedTeardown(*f);
+		}
+	}
+	return {{"running", running}, {"encoder", pvEncId}};
+}
+
+void previewOff()
+{
+	std::lock_guard<std::mutex> l(pvMu);
+	for (auto &[_, f] : feeds)
+		feedTeardown(*f);
+	feeds.clear();
+}
+
+void previewTick()
+{
+	{
+		std::lock_guard<std::mutex> l(pvMu);
+		if (feeds.empty() || std::chrono::steady_clock::now() - pvLastOn < PV_KEEPALIVE)
+			return;
+	}
+	previewOff();
+}
+
+} // namespace shy

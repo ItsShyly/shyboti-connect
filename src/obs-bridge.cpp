@@ -698,6 +698,19 @@ json handleRelayRequest(const std::string &type, const json &dataIn)
 	}
 	if (type == "GetStats")
 		return obsRequest(type);
+	if (type == "PreviewVideo") {
+		// >>> "" = program output, names = picked scenes
+		std::vector<std::string> wanted;
+		json list = arr(data, "scenes");
+		for (auto &s : list)
+			if (s.is_string())
+				wanted.push_back(s.get<std::string>());
+		if (wanted.empty()) {
+			previewOff();
+			return {{"running", json::array()}};
+		}
+		return previewSet(wanted);
+	}
 	if (type == "RemoveInput") {
 		obsRequest(type, {{"inputName", inputName}});
 		return json::object();

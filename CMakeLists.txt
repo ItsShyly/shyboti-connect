@@ -88,7 +88,7 @@ set_target_properties(
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.cpp src/settings.cpp src/obs-bridge.cpp src/relay.cpp src/rules.cpp src/ui.cpp
+  PRIVATE src/plugin-main.cpp src/settings.cpp src/obs-bridge.cpp src/relay.cpp src/rules.cpp src/ui.cpp src/preview.cpp
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
