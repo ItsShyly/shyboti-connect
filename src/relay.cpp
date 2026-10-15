@@ -117,6 +117,42 @@ std::string relayChannel()
 	return channel;
 }
 
+// >>> newest release, the server tells us on connect and every pong
+static std::string latestPlugin;
+static void noteLatest(const json &msg)
+{
+	std::string v = jstr(msg, "latestPlugin");
+	if (v.empty())
+		return;
+	std::lock_guard<std::mutex> l(chMu);
+	latestPlugin = v;
+}
+
+std::string relayLatestPlugin()
+{
+	std::lock_guard<std::mutex> l(chMu);
+	return latestPlugin;
+}
+
+// >>> same server as the relay, wss://x/api/agent -> https://x/api/agent/download/<os>
+std::string relayDownloadUrl()
+{
+	std::string url = loadConfig().relayUrl;
+	if (url.rfind("wss://", 0) == 0)
+		url = "https://" + url.substr(6);
+	else if (url.rfind("ws://", 0) == 0)
+		url = "http://" + url.substr(5);
+	while (!url.empty() && url.back() == '/')
+		url.pop_back();
+#if defined(_WIN32)
+	return url + "/download/windows";
+#elif defined(__APPLE__)
+	return url + "/download/mac";
+#else
+	return url + "/download/linux";
+#endif
+}
+
 // vvv incoming vvv
 static void handleRequest(const json &msg)
 {
@@ -152,6 +188,7 @@ static void handleMessage(ix::WebSocket *self, const std::string &raw)
 	std::string op = jstr(msg, "op");
 
 	if (op == "identified") {
+		noteLatest(msg);
 		{
 			std::lock_guard<std::mutex> l(chMu);
 			channel = jstr(msg, "channel");
@@ -174,8 +211,10 @@ static void handleMessage(ix::WebSocket *self, const std::string &raw)
 		}
 		return;
 	}
-	if (op == "pong")
+	if (op == "pong") {
+		noteLatest(msg);
 		return;
+	}
 	if (op == "rules") {
 		if (msg["rules"].is_array()) {
 			rulesSet(msg["rules"]);

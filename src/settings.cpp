@@ -78,6 +78,7 @@ Config loadConfig()
 		c.previewQuality = std::max(0, std::min(3, (int)q));
 	if (j.is_object() && j.contains("previewAutoLower"))
 		c.previewAutoLower = jtruthy(j, "previewAutoLower");
+	c.multiviewOnStart = jtruthy(j, "multiviewOnStart");
 	// >>> no token yet, check the agent's config
 	if (c.token.empty()) {
 		fs::path old = homeDir() / ".shyboti-agent" / "config.json";
@@ -104,6 +105,7 @@ void saveConfig(const Config &c)
 	j["dockShown"] = c.dockShown;
 	j["previewQuality"] = c.previewQuality;
 	j["previewAutoLower"] = c.previewAutoLower;
+	j["multiviewOnStart"] = c.multiviewOnStart;
 	writeJsonFile(configPath("config.json"), j);
 }
 

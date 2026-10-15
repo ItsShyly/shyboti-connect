@@ -17,6 +17,7 @@ struct Config {
 	bool dockShown = false;
 	int previewQuality = 2; // <<< 0 off, 1 low, 2 medium, 3 high
 	bool previewAutoLower = true;
+	bool multiviewOnStart = false;
 };
 Config loadConfig();
 void saveConfig(const Config &c);
@@ -48,6 +49,8 @@ void relayStart();
 void relayStop();
 RelayState relayState();
 std::string relayChannel();
+std::string relayLatestPlugin();
+std::string relayDownloadUrl();
 void relaySendEvent(const std::string &type, const json &data);
 bool relaySendBinary(const std::string &buf);
 
