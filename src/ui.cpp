@@ -3,12 +3,14 @@
 
 #include <obs-frontend-api.h>
 #include <obs-module.h>
+#include <plugin-support.h>
 
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
 #include <QColor>
 #include <QComboBox>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDockWidget>
 #include <QHBoxLayout>
@@ -28,13 +30,16 @@
 #include <QScrollBar>
 #include <QThread>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace shy {
@@ -105,6 +110,34 @@ static const char *DOCK_ID = "shyboti-dock";
 static bool autoConnect = true; // <<< cached, refresh runs twice a second
 static int previewQuality = 2;
 static bool previewAutoLower = true;
+static bool multiviewOnStart = false;
+
+// >>> "0.2.10" beats "0.2.9", plain string compare gets that wrong
+static bool isNewer(const std::string &latest, const std::string &current)
+{
+	auto parts = [](const std::string &v) {
+		std::vector<int> out;
+		size_t i = 0;
+		while (i < v.size() && out.size() < 3) {
+			out.push_back(std::atoi(v.c_str() + i));
+			size_t dot = v.find('.', i);
+			if (dot == std::string::npos)
+				break;
+			i = dot + 1;
+		}
+		out.resize(3, 0);
+		return out;
+	};
+	return parts(latest) > parts(current);
+}
+
+static QString availableUpdate()
+{
+	std::string latest = relayLatestPlugin();
+	if (latest.empty() || !isNewer(latest, PLUGIN_VERSION))
+		return QString();
+	return QString::fromStdString(latest);
+}
 
 static QColor stateColor()
 {
@@ -167,6 +200,16 @@ static void setPreview(int quality, bool autoLower)
 	previewConfigure(quality, autoLower);
 }
 
+static void setMultiviewOnStart(bool on)
+{
+	if (multiviewOnStart == on)
+		return;
+	multiviewOnStart = on;
+	Config c = loadConfig();
+	c.multiviewOnStart = on;
+	saveConfig(c);
+}
+
 static QIcon dotIcon(const QColor &color)
 {
 	QPixmap pm(12, 12);
@@ -188,6 +231,9 @@ struct Controls {
 	QPointer<QCheckBox> autoBox;
 	QPointer<QComboBox> quality;
 	QPointer<QCheckBox> lowerBox;
+	QPointer<QCheckBox> multiviewBox;
+	QPointer<QWidget> updateRow;
+	QPointer<QLabel> updateText;
 };
 static std::vector<Controls> controls;
 static QPointer<QTimer> refreshTimer;
@@ -197,9 +243,14 @@ static void refreshControls()
 	QString status = statusText();
 	QString dotCss = QStringLiteral("background:%1;border-radius:5px;").arg(stateColor().name());
 	QString label = isOnline() ? T("Disconnect") : T("Connect");
+	QString update = availableUpdate();
 	controls.erase(std::remove_if(controls.begin(), controls.end(), [](const Controls &c) { return !c.text; }),
 		       controls.end());
 	for (auto &c : controls) {
+		QSignalBlocker blockM(c.multiviewBox);
+		c.multiviewBox->setChecked(multiviewOnStart);
+		c.updateRow->setVisible(!update.isEmpty());
+		c.updateText->setText(T("Update.Available").arg(update));
 		c.dot->setStyleSheet(dotCss);
 		c.text->setText(status);
 		c.button->setText(label);
@@ -213,8 +264,9 @@ static void refreshControls()
 	}
 }
 
-// >>> status row + connect button + auto start box, same in dock and window
-static void addControls(QWidget *parent, QVBoxLayout *lay, std::function<QString()> token)
+// >>> status row + connect button + options, same in dock and window.
+// update row comes back so the dock can put it at the very bottom
+static QWidget *addControls(QWidget *parent, QVBoxLayout *lay, std::function<QString()> token)
 {
 	auto *dot = new QLabel(parent);
 	dot->setFixedSize(10, 10);
@@ -245,13 +297,30 @@ static void addControls(QWidget *parent, QVBoxLayout *lay, std::function<QString
 	});
 	QObject::connect(lowerBox, &QCheckBox::toggled, parent, [](bool on) { setPreview(previewQuality, on); });
 
+	auto *multiviewBox = new QCheckBox(T("Multiview.OnStart"), parent);
+	QObject::connect(multiviewBox, &QCheckBox::toggled, parent, [](bool on) { setMultiviewOnStart(on); });
+
+	auto *updateRow = new QWidget(parent);
+	auto *updateLay = new QVBoxLayout(updateRow);
+	updateLay->setContentsMargins(0, 0, 0, 0);
+	auto *updateText = new QLabel(updateRow);
+	updateText->setWordWrap(true);
+	auto *updateBtn = new QPushButton(T("Update.Download"), updateRow);
+	QObject::connect(updateBtn, &QPushButton::clicked, updateRow,
+			 []() { QDesktopServices::openUrl(QUrl(QString::fromStdString(relayDownloadUrl()))); });
+	updateLay->addWidget(updateText);
+	updateLay->addWidget(updateBtn);
+	updateRow->hide();
+
 	lay->addLayout(statusRow);
 	lay->addWidget(button);
 	lay->addWidget(autoBox);
 	lay->addLayout(qualityRow);
 	lay->addWidget(lowerBox);
-	controls.push_back({dot, text, button, autoBox, quality, lowerBox});
+	lay->addWidget(multiviewBox);
+	controls.push_back({dot, text, button, autoBox, quality, lowerBox, multiviewBox, updateRow, updateText});
 	refreshControls();
+	return updateRow;
 }
 
 // vvv settings window vvv
@@ -283,7 +352,8 @@ static void openDialog()
 	auto *lay = new QVBoxLayout(d);
 	lay->addWidget(new QLabel(T("Token"), d));
 	lay->addWidget(token);
-	addControls(d, lay, [token]() { return token->text(); });
+	QWidget *updateRow = addControls(d, lay, [token]() { return token->text(); });
+	lay->addWidget(updateRow);
 	lay->addWidget(logView, 1);
 
 	auto shown = std::make_shared<QString>();
@@ -310,8 +380,9 @@ static void addDock()
 	auto *w = new QWidget();
 	w->setMinimumWidth(180);
 	auto *lay = new QVBoxLayout(w);
-	addControls(w, lay, nullptr);
+	QWidget *updateRow = addControls(w, lay, nullptr);
 	lay->addStretch(1);
+	lay->addWidget(updateRow);
 	if (!obs_frontend_add_dock_by_id(DOCK_ID, obs_module_text("Dock"), w))
 		log("Could not add the ShyBoti dock.");
 }
@@ -356,6 +427,7 @@ void uiInit()
 	autoConnect = cfg.autoConnect;
 	previewQuality = cfg.previewQuality;
 	previewAutoLower = cfg.previewAutoLower;
+	multiviewOnStart = cfg.multiviewOnStart;
 	addMenu();
 	addDock();
 	refreshTimer = new QTimer(qApp);
@@ -367,6 +439,12 @@ void uiInit()
 void uiLoaded()
 {
 	Config c = loadConfig();
+	// >>> obs may restore its own projectors first, don't open a second one
+	if (c.multiviewOnStart)
+		QTimer::singleShot(1500, qApp, []() {
+			if (!jtruthy(scanProjectors(), "open"))
+				obs_frontend_open_projector("Multiview", -1, "", "");
+		});
 	if (c.dockShown)
 		return;
 	auto *main = static_cast<QMainWindow *>(obs_frontend_get_main_window());
