@@ -306,9 +306,8 @@ static QWidget *addControls(QWidget *parent, QVBoxLayout *lay, std::function<QSt
 	auto *updateText = new QLabel(updateRow);
 	updateText->setWordWrap(true);
 	auto *updateBtn = new QPushButton(T("Update.Download"), updateRow);
-	QObject::connect(updateBtn, &QPushButton::clicked, updateRow, []() {
-		QDesktopServices::openUrl(QUrl(QString::fromStdString(relayDownloadUrl())));
-	});
+	QObject::connect(updateBtn, &QPushButton::clicked, updateRow,
+			 []() { QDesktopServices::openUrl(QUrl(QString::fromStdString(relayDownloadUrl()))); });
 	updateLay->addWidget(updateText);
 	updateLay->addWidget(updateBtn);
 	updateRow->hide();
