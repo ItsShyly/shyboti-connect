@@ -322,6 +322,7 @@ static void tickerLoop()
 			jnum(d, "outputCongestion", congestion);
 			relaySendEvent("BitrateUpdate",
 				       {{"kbps", kbps}, {"congested", congestion > 0.15}, {"streaming", streaming}});
+			previewNoteCongestion(streaming && congestion > 0.15);
 			// >>> rules run here even when shyboti is unreachable
 			if (kbps.is_number())
 				rulesOnBitrate(kbps.get<int>());
@@ -339,6 +340,10 @@ void agentStart()
 	psa_crypto_init();
 #endif
 	ix::initNetSystem();
+	{
+		Config cfg = loadConfig();
+		previewConfigure(cfg.previewQuality, cfg.previewAutoLower);
+	}
 	running = true;
 	worker = std::thread(workerLoop);
 	ticker = std::thread(tickerLoop);

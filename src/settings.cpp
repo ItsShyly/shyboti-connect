@@ -4,6 +4,7 @@
 #include <plugin-support.h>
 #include <util/platform.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -72,6 +73,11 @@ Config loadConfig()
 	if (j.is_object() && j.contains("autoConnect"))
 		c.autoConnect = jtruthy(j, "autoConnect");
 	c.dockShown = jtruthy(j, "dockShown");
+	double q;
+	if (jnum(j, "previewQuality", q))
+		c.previewQuality = std::max(0, std::min(3, (int)q));
+	if (j.is_object() && j.contains("previewAutoLower"))
+		c.previewAutoLower = jtruthy(j, "previewAutoLower");
 	// >>> no token yet, check the agent's config
 	if (c.token.empty()) {
 		fs::path old = homeDir() / ".shyboti-agent" / "config.json";
@@ -96,6 +102,8 @@ void saveConfig(const Config &c)
 	j["token"] = c.token;
 	j["autoConnect"] = c.autoConnect;
 	j["dockShown"] = c.dockShown;
+	j["previewQuality"] = c.previewQuality;
+	j["previewAutoLower"] = c.previewAutoLower;
 	writeJsonFile(configPath("config.json"), j);
 }
 

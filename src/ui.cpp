@@ -8,6 +8,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QColor>
+#include <QComboBox>
 #include <QDialog>
 #include <QDockWidget>
 #include <QHBoxLayout>
@@ -102,6 +103,8 @@ static QString statusText()
 // vvv shared state for dock, menu and settings window vvv
 static const char *DOCK_ID = "shyboti-dock";
 static bool autoConnect = true; // <<< cached, refresh runs twice a second
+static int previewQuality = 2;
+static bool previewAutoLower = true;
 
 static QColor stateColor()
 {
@@ -150,6 +153,20 @@ static void setAutoConnect(bool on)
 	log(on ? "Auto connect on." : "Auto connect off.");
 }
 
+// >>> preview picks it up on its next tick, no restart needed here
+static void setPreview(int quality, bool autoLower)
+{
+	if (previewQuality == quality && previewAutoLower == autoLower)
+		return;
+	previewQuality = quality;
+	previewAutoLower = autoLower;
+	Config c = loadConfig();
+	c.previewQuality = quality;
+	c.previewAutoLower = autoLower;
+	saveConfig(c);
+	previewConfigure(quality, autoLower);
+}
+
 static QIcon dotIcon(const QColor &color)
 {
 	QPixmap pm(12, 12);
@@ -169,6 +186,8 @@ struct Controls {
 	QPointer<QLabel> text;
 	QPointer<QPushButton> button;
 	QPointer<QCheckBox> autoBox;
+	QPointer<QComboBox> quality;
+	QPointer<QCheckBox> lowerBox;
 };
 static std::vector<Controls> controls;
 static QPointer<QTimer> refreshTimer;
@@ -186,6 +205,11 @@ static void refreshControls()
 		c.button->setText(label);
 		QSignalBlocker block(c.autoBox);
 		c.autoBox->setChecked(autoConnect);
+		QSignalBlocker blockQ(c.quality);
+		c.quality->setCurrentIndex(previewQuality);
+		QSignalBlocker blockL(c.lowerBox);
+		c.lowerBox->setChecked(previewAutoLower);
+		c.lowerBox->setEnabled(previewQuality > 1);
 	}
 }
 
@@ -208,10 +232,25 @@ static void addControls(QWidget *parent, QVBoxLayout *lay, std::function<QString
 	});
 	QObject::connect(autoBox, &QCheckBox::toggled, parent, [](bool on) { setAutoConnect(on); });
 
+	// >>> live preview quality, index = config value
+	auto *quality = new QComboBox(parent);
+	quality->addItems({T("Preview.Off"), T("Preview.Low"), T("Preview.Medium"), T("Preview.High")});
+	auto *qualityRow = new QHBoxLayout();
+	qualityRow->addWidget(new QLabel(T("Preview.Quality"), parent));
+	qualityRow->addWidget(quality, 1);
+	auto *lowerBox = new QCheckBox(T("Preview.AutoLower"), parent);
+	QObject::connect(quality, &QComboBox::currentIndexChanged, parent, [](int i) {
+		setPreview(i, previewAutoLower);
+		refreshControls();
+	});
+	QObject::connect(lowerBox, &QCheckBox::toggled, parent, [](bool on) { setPreview(previewQuality, on); });
+
 	lay->addLayout(statusRow);
 	lay->addWidget(button);
 	lay->addWidget(autoBox);
-	controls.push_back({dot, text, button, autoBox});
+	lay->addLayout(qualityRow);
+	lay->addWidget(lowerBox);
+	controls.push_back({dot, text, button, autoBox, quality, lowerBox});
 	refreshControls();
 }
 
@@ -313,7 +352,10 @@ static void addMenu()
 
 void uiInit()
 {
-	autoConnect = loadConfig().autoConnect;
+	Config cfg = loadConfig();
+	autoConnect = cfg.autoConnect;
+	previewQuality = cfg.previewQuality;
+	previewAutoLower = cfg.previewAutoLower;
 	addMenu();
 	addDock();
 	refreshTimer = new QTimer(qApp);
