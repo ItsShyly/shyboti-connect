@@ -91,6 +91,21 @@ void relaySendEvent(const std::string &type, const json &data)
 	sendJson({{"op", "event"}, {"type", type}, {"data", data}});
 }
 
+// >>> false = dropped, slow upload backs up here instead of in obs
+bool relaySendBinary(const std::string &buf)
+{
+	if (!identified)
+		return false;
+	std::shared_ptr<ix::WebSocket> s;
+	{
+		std::lock_guard<std::mutex> l(wsMu);
+		s = ws;
+	}
+	if (!s || s->getReadyState() != ix::ReadyState::Open || s->bufferedAmount() > 512 * 1024)
+		return false;
+	return s->sendBinary(buf).success;
+}
+
 RelayState relayState()
 {
 	return state;
@@ -207,6 +222,7 @@ void relayStart()
 		}
 		if (m->type == T::Close) {
 			bool was = identified.exchange(false);
+			previewOff();
 			uint16_t code = m->closeInfo.code;
 			if (code == 4002) {
 				// >>> two agents kick each other forever otherwise
@@ -245,6 +261,7 @@ void relayStop()
 	}
 	identified = false;
 	state = RelayState::Off;
+	previewOff();
 	if (s) {
 		s->disableAutomaticReconnection();
 		s->stop();
@@ -270,6 +287,7 @@ static void tickerLoop()
 			return;
 		auto now = clock::now();
 		obsEventsTick();
+		previewTick();
 
 		if (now >= nextPing) {
 			nextPing = now + std::chrono::seconds(20);

@@ -44,6 +44,7 @@ static void onFrontendEvent(enum obs_frontend_event event, void *)
 bool obs_module_load(void)
 {
 	obs_log(LOG_INFO, "plugin loaded (version %s)", PLUGIN_VERSION);
+	shy::previewRegister();
 	return true;
 }
 
