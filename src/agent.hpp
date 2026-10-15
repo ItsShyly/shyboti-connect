@@ -15,6 +15,8 @@ struct Config {
 	std::string relayUrl = "wss://shyboti.de/api/agent";
 	bool autoConnect = true;
 	bool dockShown = false;
+	int previewQuality = 2; // <<< 0 off, 1 low, 2 medium, 3 high
+	bool previewAutoLower = true;
 };
 Config loadConfig();
 void saveConfig(const Config &c);
@@ -54,6 +56,8 @@ void previewRegister();
 json previewSet(const std::vector<std::string> &wanted);
 void previewOff();
 void previewTick();
+void previewConfigure(int quality, bool autoLower);
+void previewNoteCongestion(bool congested);
 
 // vvv rules (rules.cpp) vvv
 void rulesLoad();

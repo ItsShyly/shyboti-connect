@@ -19,12 +19,28 @@
 
 namespace shy {
 
-static const uint32_t PV_WIDTH = 960;
-static const int PV_KBPS = 900;
-static const int PV_FPS = 30;
+struct Preset {
+	uint32_t width;
+	int fps;
+	int kbps;
+	const char *name;
+};
+// >>> index = PreviewQuality in the config
+static const Preset PRESETS[] = {
+	{0, 0, 0, "off"},
+	{640, 15, 300, "low"},
+	{960, 30, 600, "medium"},
+	{1280, 30, 1200, "high"},
+};
 static const size_t PV_MAX_SCENES = 2; // <<< each one is an extra render + encoder session
 // >>> dashboard repeats the wanted list every 10s, silence means nobody's left
 static const auto PV_KEEPALIVE = std::chrono::seconds(25);
+// >>> stream has to stay calm this long before quality comes back
+static const auto PV_CALM = std::chrono::seconds(30);
+
+static std::atomic<int> pvQuality{2};
+static std::atomic<bool> pvAutoLower{true};
+static std::atomic<bool> pvLowered{false};
 
 struct Feed {
 	std::string scene;
@@ -38,6 +54,8 @@ struct Feed {
 static std::mutex pvMu;
 static std::map<std::string, std::unique_ptr<Feed>> feeds;
 static std::string pvEncId; // <<< first encoder that worked, skip the rest next time
+static int pvRunningQuality = -1;
+static std::vector<std::string> pvWanted;
 static std::chrono::steady_clock::time_point pvLastOn;
 
 // vvv output that hands packets to the relay vvv
@@ -155,11 +173,11 @@ static std::vector<std::string> pvEncoderIds()
 	return hw;
 }
 
-static obs_data_t *pvSettings(const std::string &id)
+static obs_data_t *pvSettings(const std::string &id, const Preset &p)
 {
 	obs_data_t *s = obs_data_create();
 	obs_data_set_string(s, "rate_control", "CBR");
-	obs_data_set_int(s, "bitrate", PV_KBPS);
+	obs_data_set_int(s, "bitrate", p.kbps);
 	// >>> short gop, switching scenes waits for the next key
 	obs_data_set_int(s, "keyint_sec", 1);
 	// >>> no b frames, keys differ per encoder
@@ -212,17 +230,17 @@ static void feedTeardown(Feed &f)
 	}
 }
 
-static bool feedStart(Feed &f, const std::string &encId)
+static bool feedStart(Feed &f, const std::string &encId, const Preset &p)
 {
 	struct obs_video_info ovi;
 	if (!obs_get_video_info(&ovi) || !ovi.base_width || !ovi.base_height)
 		return false;
-	uint32_t w = std::min<uint32_t>(PV_WIDTH, ovi.base_width);
+	uint32_t w = std::min<uint32_t>(p.width, ovi.base_width);
 	// >>> encoders want even sizes
 	uint32_t h = (uint32_t)std::lround((double)ovi.base_height * w / ovi.base_width) & ~1u;
 	w &= ~1u;
 	double fps = ovi.fps_den ? (double)ovi.fps_num / ovi.fps_den : 30;
-	uint32_t div = (uint32_t)std::max(1L, std::lround(fps / PV_FPS));
+	uint32_t div = (uint32_t)std::max(1L, std::lround(fps / p.fps));
 
 	video_t *video = obs_get_video();
 	if (!f.scene.empty()) {
@@ -246,7 +264,7 @@ static bool feedStart(Feed &f, const std::string &encId)
 			return false;
 	}
 
-	obs_data_t *s = pvSettings(encId);
+	obs_data_t *s = pvSettings(encId, p);
 	f.enc = obs_video_encoder_create(encId.c_str(), "shyboti-preview-enc", s, nullptr);
 	obs_data_release(s);
 	if (!f.enc)
@@ -275,11 +293,35 @@ static bool feedRunning(const Feed &f)
 	return f.out && obs_output_active(f.out);
 }
 
-// >>> wanted list in, running list out. extra scenes past the cap are ignored
-json previewSet(const std::vector<std::string> &wanted)
+// >>> struggling stream drops everything to low until it's calm again
+static int effectiveQuality()
 {
-	std::lock_guard<std::mutex> l(pvMu);
-	pvLastOn = std::chrono::steady_clock::now();
+	int q = pvQuality;
+	return q > 1 && pvAutoLower && pvLowered ? 1 : q;
+}
+
+static void teardownAllLocked()
+{
+	for (auto &[_, f] : feeds)
+		feedTeardown(*f);
+	feeds.clear();
+}
+
+// >>> wanted list in, running list out. extra scenes past the cap are ignored
+static json applyLocked(const std::vector<std::string> &wanted)
+{
+	int q = effectiveQuality();
+	json status = {{"quality", PRESETS[q].name}, {"lowered", q != pvQuality.load()}};
+	// >>> new preset means new encoders, no way to change size on the fly
+	if (q != pvRunningQuality)
+		teardownAllLocked();
+	pvRunningQuality = q;
+	if (q == 0) {
+		pvWanted = wanted; // <<< kept so switching off -> on starts right away
+		status["running"] = json::array();
+		return status;
+	}
+	const Preset &p = PRESETS[q];
 
 	std::vector<std::string> want;
 	size_t sceneCount = 0;
@@ -292,6 +334,7 @@ json previewSet(const std::vector<std::string> &wanted)
 			sceneCount++;
 		want.push_back(s);
 	}
+	pvWanted = want;
 
 	for (auto it = feeds.begin(); it != feeds.end();) {
 		bool keep = std::find(want.begin(), want.end(), it->first) != want.end() && feedRunning(*it->second);
@@ -312,7 +355,7 @@ json previewSet(const std::vector<std::string> &wanted)
 		for (auto &id : pvEncoderIds()) {
 			auto f = std::make_unique<Feed>();
 			f->scene = s;
-			if (feedStart(*f, id)) {
+			if (feedStart(*f, id, p)) {
 				if (pvEncId != id)
 					log("Live preview uses " + id + ".");
 				pvEncId = id;
@@ -323,25 +366,60 @@ json previewSet(const std::vector<std::string> &wanted)
 			feedTeardown(*f);
 		}
 	}
-	return {{"running", running}, {"encoder", pvEncId}};
+	status["running"] = running;
+	status["encoder"] = pvEncId;
+	return status;
+}
+
+json previewSet(const std::vector<std::string> &wanted)
+{
+	std::lock_guard<std::mutex> l(pvMu);
+	pvLastOn = std::chrono::steady_clock::now();
+	return applyLocked(wanted);
 }
 
 void previewOff()
 {
 	std::lock_guard<std::mutex> l(pvMu);
-	for (auto &[_, f] : feeds)
-		feedTeardown(*f);
-	feeds.clear();
+	teardownAllLocked();
+	pvWanted.clear();
+	pvRunningQuality = -1;
+}
+
+void previewConfigure(int quality, bool autoLower)
+{
+	pvQuality = std::max(0, std::min(3, quality));
+	pvAutoLower = autoLower;
+}
+
+// >>> ticker feeds this every few seconds while streaming
+void previewNoteCongestion(bool congested)
+{
+	static std::chrono::steady_clock::time_point lastBad;
+	auto now = std::chrono::steady_clock::now();
+	if (congested) {
+		lastBad = now;
+		if (!pvLowered.exchange(true) && pvAutoLower && pvQuality > 1)
+			log("Stream is struggling, live preview dropped to low.");
+	} else if (pvLowered && now - lastBad > PV_CALM) {
+		pvLowered = false;
+	}
 }
 
 void previewTick()
 {
-	{
-		std::lock_guard<std::mutex> l(pvMu);
-		if (feeds.empty() || std::chrono::steady_clock::now() - pvLastOn < PV_KEEPALIVE)
-			return;
+	std::lock_guard<std::mutex> l(pvMu);
+	if (pvWanted.empty())
+		return;
+	if (std::chrono::steady_clock::now() - pvLastOn >= PV_KEEPALIVE) {
+		teardownAllLocked();
+		pvWanted.clear();
+		pvRunningQuality = -1;
+		return;
 	}
-	previewOff();
+	// >>> dock change or congestion, restart at the new preset
+	if (effectiveQuality() != pvRunningQuality)
+		applyLocked(std::vector<std::string>(pvWanted));
 }
 
 } // namespace shy
