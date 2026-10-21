@@ -161,15 +161,7 @@ void previewRegister()
 }
 
 // vvv encoder pick, gpu first, x264 if nothing else works vvv
-static bool isHardware(const std::string &id)
-{
-	for (const char *k : {"nvenc", "amf", "qsv", "videotoolbox"})
-		if (id.find(k) != std::string::npos)
-			return true;
-	return false;
-}
-
-// >>> texture encoders crash on our own video, scenes use plain ones
+// >>> gpu encoders crash on our own video (no core mix), scenes get x264 only
 static std::vector<std::string> pvEncoderIds(bool raw)
 {
 	std::vector<std::string> hw;
@@ -187,8 +179,7 @@ static std::vector<std::string> pvEncoderIds(bool raw)
 			x264 = true;
 			continue;
 		}
-		bool tex = caps & OBS_ENCODER_CAP_PASS_TEXTURE;
-		if (raw ? (!tex && isHardware(s)) : (tex && !(caps & OBS_ENCODER_CAP_INTERNAL)))
+		if (!raw && (caps & OBS_ENCODER_CAP_PASS_TEXTURE) && !(caps & OBS_ENCODER_CAP_INTERNAL))
 			hw.push_back(s);
 	}
 	if (x264)
